@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -28,6 +29,20 @@ const (
 	Magenta = "\033[35m"
 	Dim     = "\033[2m"
 )
+
+// Config represents the user's configuration
+type Config struct {
+	Workspace      string          `json:"workspace"`
+	RepoSlug       string          `json:"repo_slug"`
+	Username       string          `json:"username"`
+	Team           []TeamMember    `json:"team"`
+	PreviewServers []PreviewServer `json:"preview_servers,omitempty"`
+}
+
+type PreviewServer struct {
+	Name    string `json:"name"`
+	Command string `json:"command"` // Command template, use {branch} as placeholder
+}
 
 type Author struct {
 	DisplayName string `json:"display_name"`
@@ -66,9 +81,9 @@ type PullRequestsResponse struct {
 }
 
 type TeamMember struct {
-	Name      string
-	QueryType string // "uuid" or "nickname"
-	Query     string
+	Name      string `json:"name"`
+	QueryType string `json:"query_type"` // "uuid" or "nickname"
+	Query     string `json:"query"`
 }
 
 type BranchInfo struct {
@@ -78,15 +93,392 @@ type BranchInfo struct {
 	PRID    int
 }
 
-var team = []TeamMember{
-	{Name: "Jackson", QueryType: "uuid", Query: "{a2270a50-355b-45d0-9fd0-cc60113cffc3}"},
-	{Name: "Nelson", QueryType: "nickname", Query: "Nelson Solano"},
-	{Name: "Justin", QueryType: "nickname", Query: "Justin Andersen"},
-	{Name: "Joe", QueryType: "nickname", Query: "Joe Busigin"},
+var config Config
+
+func getConfigDir() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".config", "deploy-builder")
+}
+
+func getConfigPath() string {
+	return filepath.Join(getConfigDir(), "config.json")
+}
+
+func getEnvPath() string {
+	return filepath.Join(getConfigDir(), ".env")
+}
+
+func getDeploysDir() string {
+	return filepath.Join(getConfigDir(), "deploys")
+}
+
+func getDeployMetadataPath(branchName string) string {
+	// Sanitize branch name for filename
+	safeName := strings.ReplaceAll(branchName, "/", "_")
+	return filepath.Join(getDeploysDir(), safeName+".json")
+}
+
+// DeployMetadata tracks which branches were merged into a deploy branch
+type DeployMetadata struct {
+	DeployBranch string   `json:"deploy_branch"`
+	Branches     []string `json:"branches"`
+	UpdatedAt    string   `json:"updated_at"`
+}
+
+func loadDeployMetadata(deployBranch string) (*DeployMetadata, error) {
+	path := getDeployMetadataPath(deployBranch)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	var meta DeployMetadata
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return nil, err
+	}
+	return &meta, nil
+}
+
+func saveDeployMetadata(deployBranch string, branches []string) error {
+	dir := getDeploysDir()
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+
+	meta := DeployMetadata{
+		DeployBranch: deployBranch,
+		Branches:     branches,
+		UpdatedAt:    time.Now().Format(time.RFC3339),
+	}
+
+	data, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(getDeployMetadataPath(deployBranch), data, 0644)
+}
+
+func addBranchesToDeployMetadata(deployBranch string, newBranches []string) error {
+	meta, err := loadDeployMetadata(deployBranch)
+	if err != nil {
+		// No existing metadata, create new
+		return saveDeployMetadata(deployBranch, newBranches)
+	}
+
+	// Add new branches, avoiding duplicates
+	existing := make(map[string]bool)
+	for _, b := range meta.Branches {
+		existing[b] = true
+	}
+	for _, b := range newBranches {
+		if !existing[b] {
+			meta.Branches = append(meta.Branches, b)
+		}
+	}
+
+	return saveDeployMetadata(deployBranch, meta.Branches)
+}
+
+func loadEnvFile() {
+	data, err := os.ReadFile(getEnvPath())
+	if err != nil {
+		return // .env file doesn't exist, that's ok
+	}
+
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) == 2 {
+			key := strings.TrimSpace(parts[0])
+			value := strings.TrimSpace(parts[1])
+			// Remove quotes if present
+			value = strings.Trim(value, "\"'")
+			if os.Getenv(key) == "" {
+				os.Setenv(key, value)
+			}
+		}
+	}
+}
+
+func saveEnvFile(password string) error {
+	dir := getConfigDir()
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+
+	content := fmt.Sprintf("BITBUCKET_APP_PASSWORD=%s\n", password)
+	return os.WriteFile(getEnvPath(), []byte(content), 0600) // 0600 for security
+}
+
+func loadConfig() error {
+	configPath := getConfigPath()
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(data, &config)
+}
+
+func saveConfig() error {
+	configPath := getConfigPath()
+
+	// Create directory if it doesn't exist
+	dir := filepath.Dir(configPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(configPath, data, 0644)
+}
+
+func configExists() bool {
+	_, err := os.Stat(getConfigPath())
+	return err == nil
+}
+
+// PRAuthor represents a unique PR author for selection
+type PRAuthor struct {
+	DisplayName string
+	Nickname    string
+	UUID        string
+}
+
+func fetchRecentPRAuthors(workspace, repo, username string) ([]PRAuthor, error) {
+	baseURL := fmt.Sprintf("https://api.bitbucket.org/2.0/repositories/%s/%s/pullrequests", workspace, repo)
+
+	params := url.Values{}
+	params.Add("pagelen", "50")
+	params.Add("fields", "values.author")
+
+	fullURL := fmt.Sprintf("%s?%s", baseURL, params.Encode())
+
+	req, err := http.NewRequest("GET", fullURL, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	bbPassword := os.Getenv("BITBUCKET_APP_PASSWORD")
+	if bbPassword == "" {
+		return nil, fmt.Errorf("BITBUCKET_APP_PASSWORD not set")
+	}
+	req.SetBasicAuth(username, bbPassword)
+	req.Header.Set("Accept", "application/json")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("API returned status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var response struct {
+		Values []struct {
+			Author struct {
+				DisplayName string `json:"display_name"`
+				Nickname    string `json:"nickname"`
+				UUID        string `json:"uuid"`
+			} `json:"author"`
+		} `json:"values"`
+	}
+
+	if err := json.Unmarshal(body, &response); err != nil {
+		return nil, err
+	}
+
+	// Deduplicate authors
+	seen := make(map[string]bool)
+	var authors []PRAuthor
+	for _, pr := range response.Values {
+		if !seen[pr.Author.UUID] {
+			seen[pr.Author.UUID] = true
+			authors = append(authors, PRAuthor{
+				DisplayName: pr.Author.DisplayName,
+				Nickname:    pr.Author.Nickname,
+				UUID:        pr.Author.UUID,
+			})
+		}
+	}
+
+	return authors, nil
+}
+
+func selectTeamMembersWithFzf(authors []PRAuthor) []TeamMember {
+	var fzfInput strings.Builder
+	authorMap := make(map[string]PRAuthor)
+
+	for _, a := range authors {
+		line := fmt.Sprintf("%-30s │ %s", a.DisplayName, a.Nickname)
+		fzfInput.WriteString(line + "\n")
+		authorMap[a.DisplayName] = a
+	}
+
+	header := fmt.Sprintf("%-30s │ %s", "Name", "Nickname")
+	divider := strings.Repeat("─", 50)
+
+	cmd := exec.Command("fzf", "--multi",
+		"--header="+header+"\n"+divider+"\nTAB=select  ENTER=confirm",
+		"--prompt=> ",
+		"--height=50%",
+		"--border=rounded",
+		"--ansi",
+		"--pointer=>",
+		"--marker=*")
+	cmd.Stdin = strings.NewReader(fzfInput.String())
+	cmd.Stderr = os.Stderr
+
+	output, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+
+	var selected []TeamMember
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		// Extract display name (first column before │)
+		parts := strings.Split(line, "│")
+		if len(parts) > 0 {
+			displayName := strings.TrimSpace(parts[0])
+			if author, ok := authorMap[displayName]; ok {
+				// Use UUID for more reliable matching
+				selected = append(selected, TeamMember{
+					Name:      author.DisplayName,
+					QueryType: "uuid",
+					Query:     author.UUID,
+				})
+			}
+		}
+	}
+
+	return selected
+}
+
+func runSetup() {
+	fmt.Printf("\n%s%s Deploy Builder Setup %s\n", Bold, Cyan, Reset)
+	fmt.Printf("%s%s%s\n\n", Dim, strings.Repeat("─", 50), Reset)
+
+	if configExists() {
+		fmt.Printf("%sExisting configuration found.%s\n", Yellow, Reset)
+		if !promptYesNo("Overwrite existing config?") {
+			fmt.Println("Setup cancelled.")
+			return
+		}
+		fmt.Println()
+	}
+
+	// Bitbucket settings
+	fmt.Printf("%sBitbucket Settings%s\n", Bold, Reset)
+	fmt.Printf("%s(Find these in your repo URL: bitbucket.org/{workspace}/{repo})%s\n\n", Dim, Reset)
+
+	config.Workspace = prompt("Workspace: ")
+	config.RepoSlug = prompt("Repository slug: ")
+	config.Username = prompt("Your Bitbucket username: ")
+
+	// Check for API password
+	if os.Getenv("BITBUCKET_APP_PASSWORD") == "" {
+		fmt.Printf("\n%sBitbucket App Password%s\n", Bold, Reset)
+		fmt.Printf("%sCreate one at: https://bitbucket.org/account/settings/app-passwords/%s\n", Dim, Reset)
+		fmt.Printf("%sRequired permissions: Repositories (Read), Pull requests (Read)%s\n\n", Dim, Reset)
+		password := prompt("App password: ")
+		if password != "" {
+			if err := saveEnvFile(password); err != nil {
+				fmt.Printf("%sWarning: Could not save password: %v%s\n", Yellow, err, Reset)
+			} else {
+				os.Setenv("BITBUCKET_APP_PASSWORD", password)
+				fmt.Printf("%s✓ Password saved to %s%s\n", Green, getEnvPath(), Reset)
+			}
+		}
+	} else {
+		fmt.Printf("\n%s✓ Bitbucket app password found%s\n", Green, Reset)
+	}
+
+	// Team members - try to fetch from repo
+	fmt.Printf("\n%sTeam Members%s\n", Bold, Reset)
+	fmt.Printf("Fetching recent PR authors from %s/%s...\n", config.Workspace, config.RepoSlug)
+
+	authors, err := fetchRecentPRAuthors(config.Workspace, config.RepoSlug, config.Username)
+	if err != nil {
+		fmt.Printf("%sWarning: Could not fetch authors: %v%s\n", Yellow, err, Reset)
+		fmt.Println("You can add team members manually by editing the config file.")
+		config.Team = []TeamMember{}
+	} else if len(authors) == 0 {
+		fmt.Printf("%sNo PR authors found in the repository.%s\n", Yellow, Reset)
+		config.Team = []TeamMember{}
+	} else {
+		fmt.Printf("Found %d unique authors. Select your team members:\n\n", len(authors))
+		config.Team = selectTeamMembersWithFzf(authors)
+
+		if len(config.Team) == 0 {
+			fmt.Printf("%sNo team members selected.%s\n", Yellow, Reset)
+		} else {
+			fmt.Printf("\n%s✓ Selected %d team members:%s\n", Green, len(config.Team), Reset)
+			for _, m := range config.Team {
+				fmt.Printf("  • %s\n", m.Name)
+			}
+		}
+	}
+
+	if len(config.Team) == 0 {
+		fmt.Printf("\n%sYou can edit the config later at: %s%s\n", Dim, getConfigPath(), Reset)
+	}
+
+	// Preview servers (optional)
+	fmt.Printf("\n%sPreview Servers (Optional)%s\n", Bold, Reset)
+	fmt.Printf("%sAdd commands to deploy to preview servers.%s\n", Dim, Reset)
+	fmt.Printf("%sUse {branch} as placeholder for the branch name.%s\n\n", Dim, Reset)
+
+	config.PreviewServers = []PreviewServer{}
+	if promptYesNo("Add preview servers?") {
+		for {
+			name := prompt("\nServer name (empty to finish): ")
+			if name == "" {
+				break
+			}
+
+			fmt.Printf("Deploy command (use {branch} for branch name)\n")
+			command := prompt("Command: ")
+
+			config.PreviewServers = append(config.PreviewServers, PreviewServer{
+				Name:    name,
+				Command: command,
+			})
+			fmt.Printf("%s✓ Added server '%s'%s\n", Green, name, Reset)
+		}
+	}
+
+	// Save config
+	if err := saveConfig(); err != nil {
+		fmt.Printf("%sError saving config: %v%s\n", Red, err, Reset)
+		os.Exit(1)
+	}
+
+	fmt.Printf("\n%s✓ Configuration saved to %s%s\n", Green, getConfigPath(), Reset)
 }
 
 func getPRsForMember(member TeamMember) ([]PullRequest, error) {
-	baseURL := "https://api.bitbucket.org/2.0/repositories/WeBuyCars/osg/pullrequests"
+	baseURL := fmt.Sprintf("https://api.bitbucket.org/2.0/repositories/%s/%s/pullrequests",
+		config.Workspace, config.RepoSlug)
 
 	params := url.Values{}
 	if member.QueryType == "uuid" {
@@ -107,11 +499,11 @@ func getPRsForMember(member TeamMember) ([]PullRequest, error) {
 	bbPassword := os.Getenv("BITBUCKET_APP_PASSWORD")
 	if bbPassword == "" {
 		fmt.Printf("%sError: BITBUCKET_APP_PASSWORD environment variable not set%s\n", Red, Reset)
-		fmt.Println("Add to your ~/.zshrc:")
+		fmt.Println("Add to your shell config:")
 		fmt.Println("  export BITBUCKET_APP_PASSWORD=\"your-app-password\"")
 		os.Exit(1)
 	}
-	req.SetBasicAuth("jkurtzgps", bbPassword)
+	req.SetBasicAuth(config.Username, bbPassword)
 	req.Header.Set("Accept", "application/json")
 
 	client := &http.Client{Timeout: 30 * time.Second}
@@ -138,7 +530,7 @@ func fetchAllTeamBranches() ([]BranchInfo, map[string][]PullRequest, error) {
 	var branches []BranchInfo
 	prsByMember := make(map[string][]PullRequest)
 
-	for _, member := range team {
+	for _, member := range config.Team {
 		prs, err := getPRsForMember(member)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%sWarning: Error fetching PRs for %s: %v%s\n", Yellow, member.Name, err, Reset)
@@ -165,7 +557,7 @@ func displayPROverview(prsByMember map[string][]PullRequest) {
 	fmt.Printf("%s%s%s\n", Dim, strings.Repeat("─", 70), Reset)
 
 	totalPRs := 0
-	for _, member := range team {
+	for _, member := range config.Team {
 		prs := prsByMember[member.Name]
 		fmt.Printf("\n%s%s%s %s(%d PRs)%s\n", Bold, Yellow, member.Name, Dim, len(prs), Reset)
 
@@ -368,7 +760,15 @@ func selectBranchesWithFzf(branches []BranchInfo) ([]BranchInfo, error) {
 }
 
 func selectPreviewServer() string {
-	options := "[1]  history   - preview-ui-history server\n[2]  feedback  - preview-feedback server\n[x]  skip      - don't deploy now"
+	if len(config.PreviewServers) == 0 {
+		return "skip"
+	}
+
+	var options strings.Builder
+	for i, server := range config.PreviewServers {
+		options.WriteString(fmt.Sprintf("[%d]  %s\n", i+1, server.Name))
+	}
+	options.WriteString("[x]  skip - don't deploy now")
 
 	cmd := exec.Command("fzf",
 		"--header=Select preview server:",
@@ -377,7 +777,7 @@ func selectPreviewServer() string {
 		"--border=rounded",
 		"--ansi",
 		"--no-info")
-	cmd.Stdin = strings.NewReader(options)
+	cmd.Stdin = strings.NewReader(options.String())
 	cmd.Stderr = os.Stderr
 
 	output, err := cmd.Output()
@@ -386,10 +786,15 @@ func selectPreviewServer() string {
 	}
 
 	result := strings.TrimSpace(string(output))
-	if strings.Contains(result, "history") {
-		return "history"
-	} else if strings.Contains(result, "feedback") {
-		return "feedback"
+	if strings.Contains(result, "skip") {
+		return "skip"
+	}
+
+	// Find which server was selected
+	for _, server := range config.PreviewServers {
+		if strings.Contains(result, server.Name) {
+			return server.Name
+		}
 	}
 	return "skip"
 }
@@ -501,8 +906,12 @@ func resyncMode(deployBranch string, branches []BranchInfo) {
 	fmt.Printf("%s%s%s\n", Dim, strings.Repeat("─", 50), Reset)
 	fmt.Printf("Deploy branch: %s%s%s\n", Yellow, deployBranch, Reset)
 
-	// Get previously merged branches
-	mergedBranches := getMergedBranchesFromLog()
+	// Get previously merged branches from metadata
+	var mergedBranches []string
+	meta, err := loadDeployMetadata(deployBranch)
+	if err == nil {
+		mergedBranches = meta.Branches
+	}
 
 	if len(mergedBranches) == 0 {
 		fmt.Printf("%sNo previously merged branches found in this deploy branch.%s\n", Yellow, Reset)
@@ -612,6 +1021,9 @@ func resyncMode(deployBranch string, branches []BranchInfo) {
 		branchNames = append(branchNames, b.Name)
 	}
 
+	// Save newly added branches to metadata
+	addBranchesToDeployMetadata(deployBranch, branchNames)
+
 	showCompletionSummary(deployBranch, branchNames)
 	offerPreviewDeploy(deployBranch)
 }
@@ -642,31 +1054,36 @@ func offerPreviewDeploy(deployBranch string) {
 		return
 	}
 
+	if len(config.PreviewServers) == 0 {
+		fmt.Printf("\n%s%sDone!%s\n\n", Bold, Green, Reset)
+		return
+	}
+
 	fmt.Printf("\n%sDeploy to preview server?%s\n", Bold, Reset)
-	server := selectPreviewServer()
+	serverName := selectPreviewServer()
 
-	if server != "skip" {
-		fmt.Printf("\nDeploying to %s%s%s preview server...\n", Cyan, server, Reset)
-		fmt.Printf("%sThis will take 4-8 minutes. Output shown below:%s\n", Dim, Reset)
-		fmt.Printf("%s%s%s\n", Dim, strings.Repeat("─", 50), Reset)
-
-		var deployCmd string
-		if server == "history" {
-			deployCmd = fmt.Sprintf("checkout-history %s", deployBranch)
-		} else {
-			deployCmd = fmt.Sprintf("checkout-feedback %s", deployBranch)
+	if serverName != "skip" {
+		// Find the server config
+		var server PreviewServer
+		for _, s := range config.PreviewServers {
+			if s.Name == serverName {
+				server = s
+				break
+			}
 		}
 
-		// For deploy, we do want to see output since it takes a while
-		if err := runCommand("zsh", "-i", "-c", deployCmd); err != nil {
+		fmt.Printf("\nDeploying to %s%s%s preview server...\n", Cyan, serverName, Reset)
+		fmt.Printf("%sOutput shown below:%s\n", Dim, Reset)
+		fmt.Printf("%s%s%s\n", Dim, strings.Repeat("─", 50), Reset)
+
+		// Replace {branch} placeholder with actual branch name
+		deployCmd := strings.ReplaceAll(server.Command, "{branch}", deployBranch)
+
+		// Run the deploy command
+		if err := runCommand("sh", "-c", deployCmd); err != nil {
 			fmt.Printf("%sWarning: Deploy command may have failed: %v%s\n", Yellow, err, Reset)
 		}
 		fmt.Printf("%s%s%s\n", Dim, strings.Repeat("─", 50), Reset)
-	} else {
-		fmt.Printf("\n%sTo deploy later, run:%s\n", Dim, Reset)
-		fmt.Printf("  checkout-history %s\n", deployBranch)
-		fmt.Printf("  # or\n")
-		fmt.Printf("  checkout-feedback %s\n", deployBranch)
 	}
 
 	fmt.Printf("\n%s%sDone!%s\n\n", Bold, Green, Reset)
@@ -681,7 +1098,7 @@ func createMode(branches []BranchInfo, prsByMember map[string][]PullRequest) {
 	today := time.Now().Format("20060102")
 	datePrefix := today + "-"
 	fmt.Printf("%sStep 2: Deploy Branch Name%s\n", Bold, Reset)
-	fmt.Printf("Format: %s<description> (e.g., %swhiparound-integration)\n", datePrefix, datePrefix)
+	fmt.Printf("Format: %s<description> (e.g., %smy-feature)\n", datePrefix, datePrefix)
 	branchName := promptWithDefault("Branch name: ", datePrefix)
 	if branchName == "" || branchName == datePrefix {
 		branchName = datePrefix + "deploy"
@@ -738,6 +1155,7 @@ func createMode(branches []BranchInfo, prsByMember map[string][]PullRequest) {
 	// Step 6: Process each selected branch
 	fmt.Printf("\n%sStep 6: Processing branches...%s\n", Bold, Reset)
 	mergedBranches := make(map[string][]string) // author -> branches
+	var allBranchNames []string
 
 	for i, branch := range selectedBranches {
 		fmt.Printf("\n%s[%d/%d]%s ", Cyan, i+1, len(selectedBranches), Reset)
@@ -745,7 +1163,11 @@ func createMode(branches []BranchInfo, prsByMember map[string][]PullRequest) {
 			os.Exit(1)
 		}
 		mergedBranches[branch.Author] = append(mergedBranches[branch.Author], branch.Name)
+		allBranchNames = append(allBranchNames, branch.Name)
 	}
+
+	// Save metadata for this deploy branch
+	saveDeployMetadata(branchName, allBranchNames)
 
 	// Step 7: Summary
 	fmt.Printf("\n%s%s%s\n", Dim, strings.Repeat("─", 50), Reset)
@@ -770,14 +1192,158 @@ func createMode(branches []BranchInfo, prsByMember map[string][]PullRequest) {
 	offerPreviewDeploy(branchName)
 }
 
+func editTeamMembers() {
+	fmt.Printf("\n%s%s Edit Team Members %s\n", Bold, Cyan, Reset)
+	fmt.Printf("%s%s%s\n\n", Dim, strings.Repeat("─", 50), Reset)
+
+	if !configExists() {
+		fmt.Printf("%sNo configuration found. Run 'deploy-builder --setup' first.%s\n", Yellow, Reset)
+		return
+	}
+
+	if err := loadConfig(); err != nil {
+		fmt.Printf("%sError loading config: %v%s\n", Red, err, Reset)
+		return
+	}
+
+	// Load env for API access
+	loadEnvFile()
+
+	if len(config.Team) > 0 {
+		fmt.Printf("%sCurrent team members:%s\n", Bold, Reset)
+		for _, m := range config.Team {
+			fmt.Printf("  • %s\n", m.Name)
+		}
+		fmt.Println()
+	}
+
+	fmt.Printf("Fetching PR authors from %s/%s...\n", config.Workspace, config.RepoSlug)
+
+	authors, err := fetchRecentPRAuthors(config.Workspace, config.RepoSlug, config.Username)
+	if err != nil {
+		fmt.Printf("%sError fetching authors: %v%s\n", Red, err, Reset)
+		return
+	}
+
+	if len(authors) == 0 {
+		fmt.Printf("%sNo PR authors found.%s\n", Yellow, Reset)
+		return
+	}
+
+	fmt.Printf("Found %d authors. Select your team members:\n\n", len(authors))
+	config.Team = selectTeamMembersWithFzf(authors)
+
+	if len(config.Team) == 0 {
+		fmt.Printf("%sNo team members selected.%s\n", Yellow, Reset)
+		return
+	}
+
+	if err := saveConfig(); err != nil {
+		fmt.Printf("%sError saving config: %v%s\n", Red, err, Reset)
+		return
+	}
+
+	fmt.Printf("\n%s✓ Updated team members:%s\n", Green, Reset)
+	for _, m := range config.Team {
+		fmt.Printf("  • %s\n", m.Name)
+	}
+	fmt.Println()
+}
+
+func printUsage() {
+	fmt.Printf("\n%s%s Deploy Branch Builder %s\n", Bold, Cyan, Reset)
+	fmt.Printf("%s%s%s\n\n", Dim, strings.Repeat("─", 50), Reset)
+	fmt.Println("Usage: deploy-builder [options]")
+	fmt.Println()
+	fmt.Println("Options:")
+	fmt.Println("  --setup    Run configuration setup")
+	fmt.Println("  --team     Edit team members")
+	fmt.Println("  --config   Show current configuration")
+	fmt.Println("  --help     Show this help message")
+	fmt.Println()
+}
+
+func showConfig() {
+	if !configExists() {
+		fmt.Printf("%sNo configuration found. Run 'deploy-builder --setup' to create one.%s\n", Yellow, Reset)
+		return
+	}
+
+	if err := loadConfig(); err != nil {
+		fmt.Printf("%sError loading config: %v%s\n", Red, err, Reset)
+		return
+	}
+
+	fmt.Printf("\n%s%s Current Configuration %s\n", Bold, Cyan, Reset)
+	fmt.Printf("%s%s%s\n\n", Dim, strings.Repeat("─", 50), Reset)
+
+	fmt.Printf("%sConfig file:%s %s\n\n", Bold, Reset, getConfigPath())
+
+	fmt.Printf("%sBitbucket:%s\n", Bold, Reset)
+	fmt.Printf("  Workspace: %s\n", config.Workspace)
+	fmt.Printf("  Repository: %s\n", config.RepoSlug)
+	fmt.Printf("  Username: %s\n", config.Username)
+
+	fmt.Printf("\n%sTeam Members:%s\n", Bold, Reset)
+	for _, m := range config.Team {
+		fmt.Printf("  • %s (%s: %s)\n", m.Name, m.QueryType, m.Query)
+	}
+
+	if len(config.PreviewServers) > 0 {
+		fmt.Printf("\n%sPreview Servers:%s\n", Bold, Reset)
+		for _, s := range config.PreviewServers {
+			fmt.Printf("  • %s: %s\n", s.Name, s.Command)
+		}
+	}
+	fmt.Println()
+}
+
 func main() {
+	// Load .env file if it exists
+	loadEnvFile()
+
+	// Parse command line arguments
+	for _, arg := range os.Args[1:] {
+		switch arg {
+		case "--setup":
+			runSetup()
+			return
+		case "--team":
+			editTeamMembers()
+			return
+		case "--config":
+			showConfig()
+			return
+		case "--help", "-h":
+			printUsage()
+			return
+		}
+	}
+
 	fmt.Printf("\n%s%s Deploy Branch Builder %s\n", Bold, Cyan, Reset)
 	fmt.Printf("%s%s%s\n", Dim, strings.Repeat("─", 50), Reset)
 
-	// Check we're in the osg repo
-	output, err := runCommandSilent("git", "rev-parse", "--show-toplevel")
-	if err != nil || !strings.Contains(output, "osg") {
-		fmt.Printf("%sError: Please run this from the osg repository%s\n", Red, Reset)
+	// Check for config
+	if !configExists() {
+		fmt.Printf("%sNo configuration found.%s\n\n", Yellow, Reset)
+		fmt.Println("Run initial setup to configure the tool.")
+		if promptYesNo("Run setup now?") {
+			runSetup()
+			fmt.Println("\nConfiguration complete. Run deploy-builder again to start.")
+		}
+		return
+	}
+
+	// Load config
+	if err := loadConfig(); err != nil {
+		fmt.Printf("%sError loading config: %v%s\n", Red, err, Reset)
+		fmt.Println("Run 'deploy-builder --setup' to reconfigure.")
+		os.Exit(1)
+	}
+
+	// Check we're in a git repo
+	if _, err := runCommandSilent("git", "rev-parse", "--show-toplevel"); err != nil {
+		fmt.Printf("%sError: Not in a git repository%s\n", Red, Reset)
 		os.Exit(1)
 	}
 
