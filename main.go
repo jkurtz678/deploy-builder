@@ -830,6 +830,12 @@ func truncate(s string, maxLen int) string {
 	return s[:maxLen-3] + "..."
 }
 
+// getHeadCommit returns the current HEAD commit hash
+func getHeadCommit() string {
+	output, _ := runCommandSilent("git", "rev-parse", "HEAD")
+	return strings.TrimSpace(output)
+}
+
 func syncAndMergeBranch(branch string, deployBranch string) error {
 	fmt.Printf("%sProcessing: %s%s\n", Cyan, branch, Reset)
 
@@ -849,11 +855,18 @@ func syncAndMergeBranch(branch string, deployBranch string) error {
 
 	// Pull latest from feature branch
 	fmt.Printf("  Pulling latest...")
+	headBefore := getHeadCommit()
 	runCommandQuiet("git", "pull", "origin", branch)
-	fmt.Printf(" %s✓%s\n", Green, Reset)
+	headAfter := getHeadCommit()
+	if headBefore != headAfter {
+		fmt.Printf(" %s✓↓%s\n", Green, Reset)
+	} else {
+		fmt.Printf(" %s✓%s\n", Green, Reset)
+	}
 
 	// Merge origin/master into feature branch
 	fmt.Printf("  Syncing with master...")
+	headBefore = getHeadCommit()
 	if err := runCommandQuiet("git", "merge", "origin/master", "-m", fmt.Sprintf("Merge origin/master into %s", branch)); err != nil {
 		if checkGitConflicts() {
 			fmt.Printf(" %s✗%s\n", Red, Reset)
@@ -865,14 +878,22 @@ func syncAndMergeBranch(branch string, deployBranch string) error {
 			return fmt.Errorf("merge conflict")
 		}
 	}
-	fmt.Printf(" %s✓%s\n", Green, Reset)
+	headAfter = getHeadCommit()
+	if headBefore != headAfter {
+		fmt.Printf(" %s✓↓%s\n", Green, Reset)
+	} else {
+		fmt.Printf(" %s✓%s\n", Green, Reset)
+	}
 
 	// Push synced feature branch to origin
 	fmt.Printf("  Pushing to origin...")
-	if err := runCommandQuiet("git", "push", "origin", branch); err != nil {
+	output, err := runCommandSilent("git", "push", "origin", branch)
+	if err != nil {
 		fmt.Printf(" %s⚠%s %s(could not push, continuing)%s\n", Yellow, Reset, Dim, Reset)
-	} else {
+	} else if strings.Contains(output, "Everything up-to-date") {
 		fmt.Printf(" %s✓%s\n", Green, Reset)
+	} else {
+		fmt.Printf(" %s✓↑%s\n", Green, Reset)
 	}
 
 	// Return to deploy branch
@@ -885,6 +906,7 @@ func syncAndMergeBranch(branch string, deployBranch string) error {
 
 	// Merge origin/feature-branch into deploy branch
 	fmt.Printf("  Merging into deploy...")
+	headBefore = getHeadCommit()
 	if err := runCommandQuiet("git", "merge", "origin/"+branch, "-m", fmt.Sprintf("Merge origin/%s into deploy", branch)); err != nil {
 		if checkGitConflicts() {
 			fmt.Printf(" %s✗%s\n", Red, Reset)
@@ -896,7 +918,12 @@ func syncAndMergeBranch(branch string, deployBranch string) error {
 			return fmt.Errorf("merge conflict")
 		}
 	}
-	fmt.Printf(" %s✓%s\n", Green, Reset)
+	headAfter = getHeadCommit()
+	if headBefore != headAfter {
+		fmt.Printf(" %s✓↓%s\n", Green, Reset)
+	} else {
+		fmt.Printf(" %s✓%s\n", Green, Reset)
+	}
 
 	return nil
 }
@@ -1156,6 +1183,12 @@ func createMode(branches []BranchInfo, prsByMember map[string][]PullRequest) {
 	fmt.Printf("\n%sStep 6: Processing branches...%s\n", Bold, Reset)
 	mergedBranches := make(map[string][]string) // author -> branches
 	var allBranchNames []string
+	for _, branch := range selectedBranches {
+		allBranchNames = append(allBranchNames, branch.Name)
+	}
+
+	// Save metadata now so branches are remembered if a merge fails
+	saveDeployMetadata(branchName, allBranchNames)
 
 	for i, branch := range selectedBranches {
 		fmt.Printf("\n%s[%d/%d]%s ", Cyan, i+1, len(selectedBranches), Reset)
@@ -1163,11 +1196,7 @@ func createMode(branches []BranchInfo, prsByMember map[string][]PullRequest) {
 			os.Exit(1)
 		}
 		mergedBranches[branch.Author] = append(mergedBranches[branch.Author], branch.Name)
-		allBranchNames = append(allBranchNames, branch.Name)
 	}
-
-	// Save metadata for this deploy branch
-	saveDeployMetadata(branchName, allBranchNames)
 
 	// Step 7: Summary
 	fmt.Printf("\n%s%s%s\n", Dim, strings.Repeat("─", 50), Reset)
