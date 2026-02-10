@@ -120,9 +120,10 @@ func getDeployMetadataPath(branchName string) string {
 
 // DeployMetadata tracks which branches were merged into a deploy branch
 type DeployMetadata struct {
-	DeployBranch string   `json:"deploy_branch"`
-	Branches     []string `json:"branches"`
-	UpdatedAt    string   `json:"updated_at"`
+	DeployBranch  string            `json:"deploy_branch"`
+	Branches      []string          `json:"branches"`
+	BranchAuthors map[string]string `json:"branch_authors,omitempty"`
+	UpdatedAt     string            `json:"updated_at"`
 }
 
 func loadDeployMetadata(deployBranch string) (*DeployMetadata, error) {
@@ -139,16 +140,17 @@ func loadDeployMetadata(deployBranch string) (*DeployMetadata, error) {
 	return &meta, nil
 }
 
-func saveDeployMetadata(deployBranch string, branches []string) error {
+func saveDeployMetadata(deployBranch string, branches []string, branchAuthors map[string]string) error {
 	dir := getDeploysDir()
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
 
 	meta := DeployMetadata{
-		DeployBranch: deployBranch,
-		Branches:     branches,
-		UpdatedAt:    time.Now().Format(time.RFC3339),
+		DeployBranch:  deployBranch,
+		Branches:      branches,
+		BranchAuthors: branchAuthors,
+		UpdatedAt:     time.Now().Format(time.RFC3339),
 	}
 
 	data, err := json.MarshalIndent(meta, "", "  ")
@@ -159,11 +161,11 @@ func saveDeployMetadata(deployBranch string, branches []string) error {
 	return os.WriteFile(getDeployMetadataPath(deployBranch), data, 0644)
 }
 
-func addBranchesToDeployMetadata(deployBranch string, newBranches []string) error {
+func addBranchesToDeployMetadata(deployBranch string, newBranches []string, newAuthors map[string]string) error {
 	meta, err := loadDeployMetadata(deployBranch)
 	if err != nil {
 		// No existing metadata, create new
-		return saveDeployMetadata(deployBranch, newBranches)
+		return saveDeployMetadata(deployBranch, newBranches, newAuthors)
 	}
 
 	// Add new branches, avoiding duplicates
@@ -177,7 +179,15 @@ func addBranchesToDeployMetadata(deployBranch string, newBranches []string) erro
 		}
 	}
 
-	return saveDeployMetadata(deployBranch, meta.Branches)
+	// Merge author maps
+	if meta.BranchAuthors == nil {
+		meta.BranchAuthors = make(map[string]string)
+	}
+	for branch, author := range newAuthors {
+		meta.BranchAuthors[branch] = author
+	}
+
+	return saveDeployMetadata(deployBranch, meta.Branches, meta.BranchAuthors)
 }
 
 func loadEnvFile() {
@@ -211,7 +221,7 @@ func saveEnvFile(password string) error {
 		return err
 	}
 
-	content := fmt.Sprintf("BITBUCKET_APP_PASSWORD=%s\n", password)
+	content := fmt.Sprintf("BITBUCKET_API_KEY=%s\n", password)
 	return os.WriteFile(getEnvPath(), []byte(content), 0600) // 0600 for security
 }
 
@@ -267,9 +277,9 @@ func fetchRecentPRAuthors(workspace, repo, username string) ([]PRAuthor, error) 
 		return nil, err
 	}
 
-	bbPassword := os.Getenv("BITBUCKET_APP_PASSWORD")
+	bbPassword := os.Getenv("BITBUCKET_API_KEY")
 	if bbPassword == "" {
-		return nil, fmt.Errorf("BITBUCKET_APP_PASSWORD not set")
+		return nil, fmt.Errorf("BITBUCKET_API_KEY not set")
 	}
 	req.SetBasicAuth(username, bbPassword)
 	req.Header.Set("Accept", "application/json")
@@ -396,21 +406,21 @@ func runSetup() {
 	config.Username = prompt("Your Bitbucket username: ")
 
 	// Check for API password
-	if os.Getenv("BITBUCKET_APP_PASSWORD") == "" {
-		fmt.Printf("\n%sBitbucket App Password%s\n", Bold, Reset)
-		fmt.Printf("%sCreate one at: https://bitbucket.org/account/settings/app-passwords/%s\n", Dim, Reset)
+	if os.Getenv("BITBUCKET_API_KEY") == "" {
+		fmt.Printf("\n%sBitbucket API Key%s\n", Bold, Reset)
+		fmt.Printf("%sCreate one at: https://bitbucket.org/account/settings/api-tokens/%s\n", Dim, Reset)
 		fmt.Printf("%sRequired permissions: Repositories (Read), Pull requests (Read)%s\n\n", Dim, Reset)
-		password := prompt("App password: ")
+		password := prompt("API key: ")
 		if password != "" {
 			if err := saveEnvFile(password); err != nil {
 				fmt.Printf("%sWarning: Could not save password: %v%s\n", Yellow, err, Reset)
 			} else {
-				os.Setenv("BITBUCKET_APP_PASSWORD", password)
+				os.Setenv("BITBUCKET_API_KEY", password)
 				fmt.Printf("%s✓ Password saved to %s%s\n", Green, getEnvPath(), Reset)
 			}
 		}
 	} else {
-		fmt.Printf("\n%s✓ Bitbucket app password found%s\n", Green, Reset)
+		fmt.Printf("\n%s✓ Bitbucket API key found%s\n", Green, Reset)
 	}
 
 	// Team members - try to fetch from repo
@@ -496,11 +506,11 @@ func getPRsForMember(member TeamMember) ([]PullRequest, error) {
 		return nil, err
 	}
 
-	bbPassword := os.Getenv("BITBUCKET_APP_PASSWORD")
+	bbPassword := os.Getenv("BITBUCKET_API_KEY")
 	if bbPassword == "" {
-		fmt.Printf("%sError: BITBUCKET_APP_PASSWORD environment variable not set%s\n", Red, Reset)
+		fmt.Printf("%sError: BITBUCKET_API_KEY environment variable not set%s\n", Red, Reset)
 		fmt.Println("Add to your shell config:")
-		fmt.Println("  export BITBUCKET_APP_PASSWORD=\"your-app-password\"")
+		fmt.Println("  export BITBUCKET_API_KEY=\"your-api-key\"")
 		os.Exit(1)
 	}
 	req.SetBasicAuth(config.Username, bbPassword)
@@ -836,6 +846,51 @@ func getHeadCommit() string {
 	return strings.TrimSpace(output)
 }
 
+// buildAuthorBranchMap builds a map of author -> []branches from BranchInfo slice
+func buildAuthorBranchMap(infos []BranchInfo) map[string][]string {
+	result := make(map[string][]string)
+	for _, info := range infos {
+		result[info.Author] = append(result[info.Author], info.Name)
+	}
+	return result
+}
+
+// buildBranchAuthorMap builds a map of branch -> author from BranchInfo slice
+func buildBranchAuthorMap(infos []BranchInfo) map[string]string {
+	result := make(map[string]string)
+	for _, info := range infos {
+		result[info.Name] = info.Author
+	}
+	return result
+}
+
+// lookupAuthorsForBranches resolves authors for branch names using available branch info and metadata
+func lookupAuthorsForBranches(branchNames []string, allBranches []BranchInfo, meta *DeployMetadata) map[string][]string {
+	// Build lookup from available branch info
+	branchToAuthor := make(map[string]string)
+	for _, b := range allBranches {
+		branchToAuthor[b.Name] = b.Author
+	}
+	// Also use metadata authors as fallback
+	if meta != nil && meta.BranchAuthors != nil {
+		for branch, author := range meta.BranchAuthors {
+			if _, exists := branchToAuthor[branch]; !exists {
+				branchToAuthor[branch] = author
+			}
+		}
+	}
+
+	result := make(map[string][]string)
+	for _, name := range branchNames {
+		author := branchToAuthor[name]
+		if author == "" {
+			author = "Unknown"
+		}
+		result[author] = append(result[author], name)
+	}
+	return result
+}
+
 func syncAndMergeBranch(branch string, deployBranch string) error {
 	fmt.Printf("%sProcessing: %s%s\n", Cyan, branch, Reset)
 
@@ -991,7 +1046,8 @@ func resyncMode(deployBranch string, branches []BranchInfo) {
 				}
 			}
 
-			showCompletionSummary(deployBranch, mergedBranches)
+			authorMap := lookupAuthorsForBranches(mergedBranches, branches, meta)
+			showCompletionSummary(deployBranch, authorMap)
 			offerPreviewDeploy(deployBranch)
 			return
 		} else if strings.Contains(choice, "Select specific") || strings.Contains(choice, "Select some") {
@@ -1020,7 +1076,8 @@ func resyncMode(deployBranch string, branches []BranchInfo) {
 				branchNames = append(branchNames, b.Name)
 			}
 
-			showCompletionSummary(deployBranch, branchNames)
+			authorMap := lookupAuthorsForBranches(branchNames, branches, meta)
+			showCompletionSummary(deployBranch, authorMap)
 			offerPreviewDeploy(deployBranch)
 			return
 		}
@@ -1049,19 +1106,31 @@ func resyncMode(deployBranch string, branches []BranchInfo) {
 	}
 
 	// Save newly added branches to metadata
-	addBranchesToDeployMetadata(deployBranch, branchNames)
+	newAuthors := buildBranchAuthorMap(selected)
+	addBranchesToDeployMetadata(deployBranch, branchNames, newAuthors)
 
-	showCompletionSummary(deployBranch, branchNames)
+	authorMap := buildAuthorBranchMap(selected)
+	showCompletionSummary(deployBranch, authorMap)
 	offerPreviewDeploy(deployBranch)
 }
 
-func showCompletionSummary(deployBranch string, branches []string) {
+func showCompletionSummary(deployBranch string, authorBranches map[string][]string) {
 	fmt.Printf("\n%s%s%s\n", Dim, strings.Repeat("─", 50), Reset)
 	fmt.Printf("%s✓ Deploy branch '%s' updated!%s\n\n", Green, deployBranch, Reset)
 
-	fmt.Printf("%sBranches synced:%s\n", Bold, Reset)
-	for _, b := range branches {
-		fmt.Printf("  • %s\n", b)
+	fmt.Printf("%sBranches included:%s\n", Bold, Reset)
+
+	var authors []string
+	for author := range authorBranches {
+		authors = append(authors, author)
+	}
+	sort.Strings(authors)
+
+	for _, author := range authors {
+		fmt.Printf("\n%s%s%s\n", Yellow, author, Reset)
+		for _, b := range authorBranches[author] {
+			fmt.Printf("- %s\n", b)
+		}
 	}
 }
 
@@ -1188,7 +1257,8 @@ func createMode(branches []BranchInfo, prsByMember map[string][]PullRequest) {
 	}
 
 	// Save metadata now so branches are remembered if a merge fails
-	saveDeployMetadata(branchName, allBranchNames)
+	branchAuthors := buildBranchAuthorMap(selectedBranches)
+	saveDeployMetadata(branchName, allBranchNames, branchAuthors)
 
 	for i, branch := range selectedBranches {
 		fmt.Printf("\n%s[%d/%d]%s ", Cyan, i+1, len(selectedBranches), Reset)
@@ -1199,22 +1269,7 @@ func createMode(branches []BranchInfo, prsByMember map[string][]PullRequest) {
 	}
 
 	// Step 7: Summary
-	fmt.Printf("\n%s%s%s\n", Dim, strings.Repeat("─", 50), Reset)
-	fmt.Printf("%s✓ Deploy branch '%s' is ready!%s\n\n", Green, branchName, Reset)
-
-	fmt.Printf("%sBranches included:%s\n", Bold, Reset)
-	var authors []string
-	for author := range mergedBranches {
-		authors = append(authors, author)
-	}
-	sort.Strings(authors)
-
-	for _, author := range authors {
-		fmt.Printf("\n%s%s%s\n", Yellow, author, Reset)
-		for _, b := range mergedBranches[author] {
-			fmt.Printf("- %s\n", b)
-		}
-	}
+	showCompletionSummary(branchName, mergedBranches)
 
 	// Step 8: Deploy to preview
 	fmt.Printf("\n%sStep 7: Deploy to preview server?%s\n", Bold, Reset)
