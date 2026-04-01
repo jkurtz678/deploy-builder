@@ -36,12 +36,17 @@ type Config struct {
 	RepoSlug       string          `json:"repo_slug"`
 	Username       string          `json:"username"`
 	Team           []TeamMember    `json:"team"`
+	SSHUsername    string          `json:"ssh_username,omitempty"`
+	JumpServer     string          `json:"jump_server,omitempty"`
+	SSHKeyName     string          `json:"ssh_key_name,omitempty"`
 	PreviewServers []PreviewServer `json:"preview_servers,omitempty"`
 }
 
 type PreviewServer struct {
-	Name    string `json:"name"`
-	Command string `json:"command"` // Command template, use {branch} as placeholder
+	Name     string `json:"name"`
+	EnvName  string `json:"env_name,omitempty"`
+	Hostname string `json:"hostname,omitempty"`
+	Command  string `json:"command,omitempty"` // Optional: custom command override; use {branch} as placeholder
 }
 
 type Author struct {
@@ -346,6 +351,7 @@ func selectTeamMembersWithFzf(authors []PRAuthor) []TeamMember {
 
 	cmd := exec.Command("fzf", "--multi",
 		"--header="+header+"\n"+divider+"\nTAB=select  ENTER=confirm",
+		"--bind=tab:toggle,shift-tab:toggle",
 		"--prompt=> ",
 		"--height=50%",
 		"--border=rounded",
@@ -455,25 +461,43 @@ func runSetup() {
 
 	// Preview servers (optional)
 	fmt.Printf("\n%sPreview Servers (Optional)%s\n", Bold, Reset)
-	fmt.Printf("%sAdd commands to deploy to preview servers.%s\n", Dim, Reset)
-	fmt.Printf("%sUse {branch} as placeholder for the branch name.%s\n\n", Dim, Reset)
+	fmt.Printf("%sDeploys are run via SSH using: osgdeploy --env-name=<env> --checkout-branch=<branch>%s\n\n", Dim, Reset)
 
 	config.PreviewServers = []PreviewServer{}
-	if promptYesNo("Add preview servers?") {
+	if promptYesNo("Set up preview servers?") {
+		fmt.Printf("\n%sSSH Connection Settings%s\n", Bold, Reset)
+		fmt.Printf("%s(These are shared across all preview servers)%s\n\n", Dim, Reset)
+
+		config.SSHUsername = prompt("Your SSH username (e.g. osg_jacksonk): ")
+		config.JumpServer = prompt("Jump server hostname: ")
+		config.SSHKeyName = prompt("SSH key filename (in ~/.ssh/, e.g. preview-dev-access.key): ")
+
+		fmt.Printf("\n%sPreview Servers%s\n", Bold, Reset)
+		fmt.Printf("%sFor each server you'll need the env name and its hostname.%s\n\n", Dim, Reset)
+
 		for {
-			name := prompt("\nServer name (empty to finish): ")
+			name := prompt("Server display name (empty to finish): ")
 			if name == "" {
 				break
 			}
 
-			fmt.Printf("Deploy command (use {branch} for branch name)\n")
-			command := prompt("Command: ")
+			envName := prompt("  Env name (e.g. preview-ui-history): ")
+			hostname := prompt("  Server hostname (e.g. preview-ui-history-deploy-a.preview.example.com): ")
 
 			config.PreviewServers = append(config.PreviewServers, PreviewServer{
-				Name:    name,
-				Command: command,
+				Name:     name,
+				EnvName:  envName,
+				Hostname: hostname,
 			})
 			fmt.Printf("%s✓ Added server '%s'%s\n", Green, name, Reset)
+		}
+
+		if len(config.PreviewServers) > 0 {
+			fmt.Printf("\n%sGenerated command preview:%s\n", Dim, Reset)
+			for _, s := range config.PreviewServers {
+				cmd := getPreviewCommand(s, "{branch}")
+				fmt.Printf("  %s%s%s: %s\n", Cyan, s.Name, Reset, cmd)
+			}
 		}
 	}
 
@@ -625,8 +649,9 @@ func runCommandSilent(name string, args ...string) (string, error) {
 	return string(output), err
 }
 
-// runCommandQuiet runs a command silently, only showing output on error
-func runCommandQuiet(name string, args ...string) error {
+// runCommandQuiet runs a command silently, only showing output on error.
+// Returns the combined output and error.
+func runCommandQuiet(name string, args ...string) (string, error) {
 	cmd := exec.Command(name, args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -634,7 +659,18 @@ func runCommandQuiet(name string, args ...string) error {
 		fmt.Printf("\n%sCommand failed: %s %s%s\n", Red, name, strings.Join(args, " "), Reset)
 		fmt.Printf("%s%s%s\n", Dim, string(output), Reset)
 	}
-	return err
+	return string(output), err
+}
+
+func getPreviewCommand(server PreviewServer, branch string) string {
+	if server.Command != "" {
+		return strings.ReplaceAll(server.Command, "{branch}", branch)
+	}
+	// Build SSH command from config fields
+	return fmt.Sprintf(
+		`ssh %s@%s "ssh -i /home/$USER/.ssh/%s $USER@%s 'sudo osgdeploy --env-name=%s --checkout-branch=%s osgwebserver_deploy --all'"`,
+		config.SSHUsername, config.JumpServer, config.SSHKeyName, server.Hostname, server.EnvName, branch,
+	)
 }
 
 func checkGitConflicts() bool {
@@ -732,6 +768,7 @@ func selectBranchesWithFzf(branches []BranchInfo) ([]BranchInfo, error) {
 
 	cmd := exec.Command("fzf", "--multi",
 		"--header="+header+"\n"+divider+"\nTAB=select  ENTER=confirm",
+		"--bind=tab:toggle,shift-tab:toggle",
 		"--prompt=> ",
 		"--height=50%",
 		"--border=rounded",
@@ -891,27 +928,131 @@ func lookupAuthorsForBranches(branchNames []string, allBranches []BranchInfo, me
 	return result
 }
 
+func removeStaleIndexLock() {
+	gitDir, err := runCommandSilent("git", "rev-parse", "--git-dir")
+	if err != nil {
+		return
+	}
+	lockPath := filepath.Join(strings.TrimSpace(gitDir), "index.lock")
+	if _, err := os.Stat(lockPath); err == nil {
+		os.Remove(lockPath)
+	}
+}
+
+// recoverIndex repairs a corrupted git index by removing the corrupt file,
+// clearing any stale lock/merge state, and rebuilding from HEAD.
+func recoverIndex() {
+	gitDir, err := runCommandSilent("git", "rev-parse", "--git-dir")
+	if err != nil {
+		return
+	}
+	dir := strings.TrimSpace(gitDir)
+
+	// Remove corrupt index, lock, and merge state files directly.
+	// We can't use "git merge --abort" because it needs a valid index.
+	for _, f := range []string{"index", "index.lock", "MERGE_HEAD", "MERGE_MSG", "MERGE_MODE"} {
+		os.Remove(filepath.Join(dir, f))
+	}
+
+	// Rebuild index from HEAD
+	runCommandSilent("git", "read-tree", "HEAD")
+}
+
+// isIndexError checks if git output indicates a transient index error.
+func isIndexError(output string) bool {
+	lower := strings.ToLower(output)
+	return strings.Contains(output, "index.lock") ||
+		(strings.Contains(lower, "unable to write") && strings.Contains(lower, "index")) ||
+		strings.Contains(lower, "index file smaller than expected")
+}
+
+// retryOnIndexError checks if git output indicates a transient index error
+// and retries the command up to 3 times with increasing backoff.
+func retryOnIndexError(output string, run func() error) error {
+	if !isIndexError(output) {
+		return fmt.Errorf("non-retryable error")
+	}
+
+	delays := []time.Duration{500 * time.Millisecond, 1 * time.Second, 2 * time.Second}
+	for _, delay := range delays {
+		removeStaleIndexLock()
+		recoverIndex()
+		time.Sleep(delay)
+		removeStaleIndexLock()
+
+		if err := run(); err == nil {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("index error persisted after retries")
+}
+
+// runGitQuiet removes any stale index.lock before running a git command quietly.
+// Retries once on transient index errors after recovering the index.
+func runGitQuiet(args ...string) error {
+	removeStaleIndexLock()
+	output, err := runCommandQuiet("git", args...)
+	if err != nil {
+		retryErr := retryOnIndexError(output, func() error {
+			_, err := runCommandQuiet("git", args...)
+			return err
+		})
+		if retryErr == nil {
+			return nil
+		}
+		// If retryErr is "non-retryable error", return the original error
+	}
+	return err
+}
+
+// runGitSilent removes any stale index.lock before running a git command silently.
+// Retries once on transient index errors after recovering the index.
+func runGitSilent(args ...string) (string, error) {
+	removeStaleIndexLock()
+	output, err := runCommandSilent("git", args...)
+	if err != nil {
+		var retryOutput string
+		retryErr := retryOnIndexError(output, func() error {
+			var retryErr error
+			retryOutput, retryErr = runCommandSilent("git", args...)
+			return retryErr
+		})
+		if retryErr == nil {
+			return retryOutput, nil
+		}
+	}
+	return output, err
+}
+
+// indexCooldown gives file watchers (IDE, Spotlight) time to settle after
+// git operations that rewrite .git/index.
+func indexCooldown() {
+	time.Sleep(200 * time.Millisecond)
+}
+
 func syncAndMergeBranch(branch string, deployBranch string) error {
 	fmt.Printf("%sProcessing: %s%s\n", Cyan, branch, Reset)
 
 	// Checkout the feature branch
 	fmt.Printf("  Checking out...")
-	if err := runCommandQuiet("git", "checkout", branch); err != nil {
+	if err := runGitQuiet("checkout", branch); err != nil {
 		// Branch might not exist locally, try to fetch it
-		if err := runCommandQuiet("git", "checkout", "-b", branch, "origin/"+branch); err != nil {
+		if err := runGitQuiet("checkout", "-b", branch, "origin/"+branch); err != nil {
 			// Try just checking out from origin
-			if err := runCommandQuiet("git", "checkout", "--track", "origin/"+branch); err != nil {
+			if err := runGitQuiet("checkout", "--track", "origin/"+branch); err != nil {
 				fmt.Printf(" %s✗%s\n", Red, Reset)
 				return fmt.Errorf("error checking out branch: %v", err)
 			}
 		}
 	}
 	fmt.Printf(" %s✓%s\n", Green, Reset)
+	indexCooldown()
 
 	// Pull latest from feature branch
 	fmt.Printf("  Pulling latest...")
 	headBefore := getHeadCommit()
-	runCommandQuiet("git", "pull", "origin", branch)
+	runGitQuiet("pull", "origin", branch)
 	headAfter := getHeadCommit()
 	if headBefore != headAfter {
 		fmt.Printf(" %s✓↓%s\n", Green, Reset)
@@ -919,10 +1060,12 @@ func syncAndMergeBranch(branch string, deployBranch string) error {
 		fmt.Printf(" %s✓%s\n", Green, Reset)
 	}
 
+	indexCooldown()
+
 	// Merge origin/master into feature branch
 	fmt.Printf("  Syncing with master...")
 	headBefore = getHeadCommit()
-	if err := runCommandQuiet("git", "merge", "origin/master", "-m", fmt.Sprintf("Merge origin/master into %s", branch)); err != nil {
+	if err := runGitQuiet("merge", "origin/master", "-m", fmt.Sprintf("Merge origin/master into %s", branch)); err != nil {
 		if checkGitConflicts() {
 			fmt.Printf(" %s✗%s\n", Red, Reset)
 			fmt.Printf("\n%s╔════════════════════════════════════════════════════════════════╗%s\n", Red, Reset)
@@ -932,6 +1075,8 @@ func syncAndMergeBranch(branch string, deployBranch string) error {
 			fmt.Printf("%s╚════════════════════════════════════════════════════════════════╝%s\n", Red, Reset)
 			return fmt.Errorf("merge conflict")
 		}
+		fmt.Printf(" %s✗%s\n", Red, Reset)
+		return fmt.Errorf("error syncing with master: %v", err)
 	}
 	headAfter = getHeadCommit()
 	if headBefore != headAfter {
@@ -940,9 +1085,11 @@ func syncAndMergeBranch(branch string, deployBranch string) error {
 		fmt.Printf(" %s✓%s\n", Green, Reset)
 	}
 
+	indexCooldown()
+
 	// Push synced feature branch to origin
 	fmt.Printf("  Pushing to origin...")
-	output, err := runCommandSilent("git", "push", "origin", branch)
+	output, err := runGitSilent("push", "origin", branch)
 	if err != nil {
 		fmt.Printf(" %s⚠%s %s(could not push, continuing)%s\n", Yellow, Reset, Dim, Reset)
 	} else if strings.Contains(output, "Everything up-to-date") {
@@ -951,18 +1098,22 @@ func syncAndMergeBranch(branch string, deployBranch string) error {
 		fmt.Printf(" %s✓↑%s\n", Green, Reset)
 	}
 
+	indexCooldown()
+
 	// Return to deploy branch
 	fmt.Printf("  Returning to deploy...")
-	if err := runCommandQuiet("git", "checkout", deployBranch); err != nil {
+	if err := runGitQuiet("checkout", deployBranch); err != nil {
 		fmt.Printf(" %s✗%s\n", Red, Reset)
 		return fmt.Errorf("error returning to deploy branch: %v", err)
 	}
 	fmt.Printf(" %s✓%s\n", Green, Reset)
 
+	indexCooldown()
+
 	// Merge origin/feature-branch into deploy branch
 	fmt.Printf("  Merging into deploy...")
 	headBefore = getHeadCommit()
-	if err := runCommandQuiet("git", "merge", "origin/"+branch, "-m", fmt.Sprintf("Merge origin/%s into deploy", branch)); err != nil {
+	if err := runGitQuiet("merge", "origin/"+branch, "-m", fmt.Sprintf("Merge origin/%s into deploy", branch)); err != nil {
 		if checkGitConflicts() {
 			fmt.Printf(" %s✗%s\n", Red, Reset)
 			fmt.Printf("\n%s╔════════════════════════════════════════════════════════════════╗%s\n", Red, Reset)
@@ -972,6 +1123,8 @@ func syncAndMergeBranch(branch string, deployBranch string) error {
 			fmt.Printf("%s╚════════════════════════════════════════════════════════════════╝%s\n", Red, Reset)
 			return fmt.Errorf("merge conflict")
 		}
+		fmt.Printf(" %s✗%s\n", Red, Reset)
+		return fmt.Errorf("error merging into deploy: %v", err)
 	}
 	headAfter = getHeadCommit()
 	if headBefore != headAfter {
@@ -981,6 +1134,43 @@ func syncAndMergeBranch(branch string, deployBranch string) error {
 	}
 
 	return nil
+}
+
+// resyncAll fetches origin and re-merges all previously merged branches into the deploy branch.
+// Returns false if there are no branches to resync or an error occurs.
+func resyncAll(deployBranch string, branches []BranchInfo) bool {
+	meta, err := loadDeployMetadata(deployBranch)
+	if err != nil || len(meta.Branches) == 0 {
+		fmt.Printf("%sNo previously merged branches found for deploy branch '%s'.%s\n", Yellow, deployBranch, Reset)
+		return false
+	}
+
+	mergedBranches := meta.Branches
+
+	fmt.Printf("\n%sPreviously merged branches:%s\n", Bold, Reset)
+	for _, b := range mergedBranches {
+		fmt.Printf("  • %s\n", b)
+	}
+
+	fmt.Printf("\n%sFetching latest from origin...%s", Bold, Reset)
+	if _, err := runCommandQuiet("git", "fetch", "origin"); err != nil {
+		fmt.Printf(" %s✗%s\n", Red, Reset)
+		return false
+	}
+	fmt.Printf(" %s✓%s\n", Green, Reset)
+
+	fmt.Printf("\n%sResyncing %d branches...%s\n", Bold, len(mergedBranches), Reset)
+	for i, branch := range mergedBranches {
+		fmt.Printf("\n%s[%d/%d]%s ", Cyan, i+1, len(mergedBranches), Reset)
+		if err := syncAndMergeBranch(branch, deployBranch); err != nil {
+			return false
+		}
+	}
+
+	authorMap := lookupAuthorsForBranches(mergedBranches, branches, meta)
+	showCompletionSummary(deployBranch, authorMap)
+	offerPreviewDeploy(deployBranch)
+	return true
 }
 
 func resyncMode(deployBranch string, branches []BranchInfo) {
@@ -1030,25 +1220,7 @@ func resyncMode(deployBranch string, branches []BranchInfo) {
 		choice := strings.TrimSpace(string(output))
 
 		if strings.Contains(choice, "Resync all") || strings.Contains(choice, "Re-sync all") {
-			// Resync all previously merged branches
-			fmt.Printf("\n%sFetching latest from origin...%s", Bold, Reset)
-			if err := runCommandQuiet("git", "fetch", "origin"); err != nil {
-				fmt.Printf(" %s✗%s\n", Red, Reset)
-				return
-			}
-			fmt.Printf(" %s✓%s\n", Green, Reset)
-
-			fmt.Printf("\n%sResyncing %d branches...%s\n", Bold, len(mergedBranches), Reset)
-			for i, branch := range mergedBranches {
-				fmt.Printf("\n%s[%d/%d]%s ", Cyan, i+1, len(mergedBranches), Reset)
-				if err := syncAndMergeBranch(branch, deployBranch); err != nil {
-					return
-				}
-			}
-
-			authorMap := lookupAuthorsForBranches(mergedBranches, branches, meta)
-			showCompletionSummary(deployBranch, authorMap)
-			offerPreviewDeploy(deployBranch)
+			resyncAll(deployBranch, branches)
 			return
 		} else if strings.Contains(choice, "Select specific") || strings.Contains(choice, "Select some") {
 			// Let user select which of the merged branches to resync
@@ -1064,7 +1236,7 @@ func resyncMode(deployBranch string, branches []BranchInfo) {
 			}
 
 			fmt.Printf("\n%sFetching latest from origin...%s", Bold, Reset)
-			runCommandQuiet("git", "fetch", "origin")
+			_, _ = runCommandQuiet("git", "fetch", "origin")
 			fmt.Printf(" %s✓%s\n", Green, Reset)
 
 			var branchNames []string
@@ -1093,7 +1265,7 @@ func resyncMode(deployBranch string, branches []BranchInfo) {
 	}
 
 	fmt.Printf("\n%sFetching latest from origin...%s", Bold, Reset)
-	runCommandQuiet("git", "fetch", "origin")
+	_, _ = runCommandQuiet("git", "fetch", "origin")
 	fmt.Printf(" %s✓%s\n", Green, Reset)
 
 	var branchNames []string
@@ -1136,7 +1308,7 @@ func showCompletionSummary(deployBranch string, authorBranches map[string][]stri
 
 func pushDeployBranch(deployBranch string) bool {
 	fmt.Printf("\nPushing deploy branch to origin...")
-	if err := runCommandQuiet("git", "push", "-u", "origin", deployBranch); err != nil {
+	if _, err := runCommandQuiet("git", "push", "-u", "origin", deployBranch); err != nil {
 		fmt.Printf(" %s✗%s\n", Red, Reset)
 		return false
 	}
@@ -1172,8 +1344,7 @@ func offerPreviewDeploy(deployBranch string) {
 		fmt.Printf("%sOutput shown below:%s\n", Dim, Reset)
 		fmt.Printf("%s%s%s\n", Dim, strings.Repeat("─", 50), Reset)
 
-		// Replace {branch} placeholder with actual branch name
-		deployCmd := strings.ReplaceAll(server.Command, "{branch}", deployBranch)
+		deployCmd := getPreviewCommand(server, deployBranch)
 
 		// Run the deploy command
 		if err := runCommand("sh", "-c", deployCmd); err != nil {
@@ -1202,7 +1373,7 @@ func createMode(branches []BranchInfo, prsByMember map[string][]PullRequest) {
 
 	// Step 3: Fetch and update origin/master
 	fmt.Printf("\n%sStep 3: Fetching latest from origin...%s", Bold, Reset)
-	if err := runCommandQuiet("git", "fetch", "origin"); err != nil {
+	if _, err := runCommandQuiet("git", "fetch", "origin"); err != nil {
 		fmt.Printf(" %s✗%s\n", Red, Reset)
 		fmt.Printf("%sError fetching from origin: %v%s\n", Red, err, Reset)
 		os.Exit(1)
@@ -1211,7 +1382,7 @@ func createMode(branches []BranchInfo, prsByMember map[string][]PullRequest) {
 
 	// Step 4: Create deploy branch from origin/master
 	fmt.Printf("\n%sStep 4: Creating deploy branch from origin/master...%s", Bold, Reset)
-	if err := runCommandQuiet("git", "checkout", "-b", branchName, "origin/master"); err != nil {
+	if _, err := runCommandQuiet("git", "checkout", "-b", branchName, "origin/master"); err != nil {
 		fmt.Printf(" %s✗%s\n", Red, Reset)
 		fmt.Println("The branch may already exist. Try a different name.")
 		os.Exit(1)
@@ -1224,15 +1395,15 @@ func createMode(branches []BranchInfo, prsByMember map[string][]PullRequest) {
 	selectedBranches, err := selectBranchesWithFzf(branches)
 	if err != nil {
 		fmt.Printf("%sSelection cancelled%s\n", Yellow, Reset)
-		runCommandQuiet("git", "checkout", "master")
-		runCommandQuiet("git", "branch", "-D", branchName)
+		_, _ = runCommandQuiet("git", "checkout", "master")
+		_, _ = runCommandQuiet("git", "branch", "-D", branchName)
 		os.Exit(1)
 	}
 
 	if len(selectedBranches) == 0 {
 		fmt.Printf("%sNo branches selected%s\n", Yellow, Reset)
-		runCommandQuiet("git", "checkout", "master")
-		runCommandQuiet("git", "branch", "-D", branchName)
+		_, _ = runCommandQuiet("git", "checkout", "master")
+		_, _ = runCommandQuiet("git", "branch", "-D", branchName)
 		os.Exit(0)
 	}
 
@@ -1242,8 +1413,8 @@ func createMode(branches []BranchInfo, prsByMember map[string][]PullRequest) {
 	}
 
 	if !promptYesNo("\nProceed with merging these branches?") {
-		runCommandQuiet("git", "checkout", "master")
-		runCommandQuiet("git", "branch", "-D", branchName)
+		_, _ = runCommandQuiet("git", "checkout", "master")
+		_, _ = runCommandQuiet("git", "branch", "-D", branchName)
 		fmt.Println("Cancelled.")
 		os.Exit(0)
 	}
@@ -1340,6 +1511,7 @@ func printUsage() {
 	fmt.Println("Usage: deploy-builder [options]")
 	fmt.Println()
 	fmt.Println("Options:")
+	fmt.Println("  -rs        Resync all branches on current deploy branch")
 	fmt.Println("  --setup    Run configuration setup")
 	fmt.Println("  --team     Edit team members")
 	fmt.Println("  --config   Show current configuration")
@@ -1374,9 +1546,17 @@ func showConfig() {
 	}
 
 	if len(config.PreviewServers) > 0 {
+		fmt.Printf("\n%sPreview SSH:%s\n", Bold, Reset)
+		fmt.Printf("  Username: %s\n", config.SSHUsername)
+		fmt.Printf("  Jump server: %s\n", config.JumpServer)
+		fmt.Printf("  SSH key: ~/.ssh/%s\n", config.SSHKeyName)
 		fmt.Printf("\n%sPreview Servers:%s\n", Bold, Reset)
 		for _, s := range config.PreviewServers {
-			fmt.Printf("  • %s: %s\n", s.Name, s.Command)
+			if s.Command != "" {
+				fmt.Printf("  • %s (custom command)\n", s.Name)
+			} else {
+				fmt.Printf("  • %s  env=%s  host=%s\n", s.Name, s.EnvName, s.Hostname)
+			}
 		}
 	}
 	fmt.Println()
@@ -1400,6 +1580,29 @@ func main() {
 			return
 		case "--help", "-h":
 			printUsage()
+			return
+		case "-rs", "--resync":
+			if err := loadConfig(); err != nil {
+				fmt.Printf("%sError loading config: %v%s\n", Red, err, Reset)
+				os.Exit(1)
+			}
+			currentBranch := getCurrentBranch()
+			if !isDeployBranch(currentBranch) {
+				fmt.Printf("%sError: Current branch '%s' is not a deploy branch.%s\n", Red, currentBranch, Reset)
+				fmt.Printf("Switch to a deploy branch first (e.g. 20260323-my-deploy).\n")
+				os.Exit(1)
+			}
+			fmt.Printf("\n%s%s Deploy Branch Builder %s\n", Bold, Cyan, Reset)
+			fmt.Printf("%s%s%s\n", Dim, strings.Repeat("─", 50), Reset)
+			fmt.Printf("Fetching team PRs from Bitbucket...\n")
+			branches, _, err := fetchAllTeamBranches()
+			if err != nil {
+				fmt.Printf("%sError fetching PRs: %v%s\n", Red, err, Reset)
+				os.Exit(1)
+			}
+			if !resyncAll(currentBranch, branches) {
+				os.Exit(1)
+			}
 			return
 		}
 	}
