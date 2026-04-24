@@ -941,6 +941,8 @@ func removeStaleIndexLock() {
 
 // recoverIndex repairs a corrupted git index by removing the corrupt file,
 // clearing any stale lock/merge state, and rebuilding from HEAD.
+// Uses "git reset --hard HEAD" to sync both the index AND working tree,
+// preventing checkout failures due to a stale working tree.
 func recoverIndex() {
 	gitDir, err := runCommandSilent("git", "rev-parse", "--git-dir")
 	if err != nil {
@@ -954,8 +956,16 @@ func recoverIndex() {
 		os.Remove(filepath.Join(dir, f))
 	}
 
-	// Rebuild index from HEAD
-	runCommandSilent("git", "read-tree", "HEAD")
+	// Rebuild index AND working tree from HEAD.
+	// "read-tree HEAD" only updates the index, leaving the working tree
+	// out of sync. "reset --hard HEAD" resets both, so subsequent
+	// checkouts won't fail with "local changes would be overwritten".
+	runCommandSilent("git", "reset", "--hard", "HEAD")
+
+	// Remove untracked files left behind from previous branch checkouts.
+	// Without this, untracked files from feature branches can block
+	// subsequent checkouts with "untracked working tree files would be overwritten".
+	runCommandSilent("git", "clean", "-fd")
 }
 
 // isIndexError checks if git output indicates a transient index error.
